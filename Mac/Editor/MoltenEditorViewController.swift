@@ -199,6 +199,8 @@ final class MoltenEditorViewController: NSViewController {
     }
 
     func scrollToHeading(pos: Int) {
+        guard isEditorReady, document?.workspaceViewController?.isSourceMode != true else { return }
+        view.window?.makeFirstResponder(webView)
         webView.evaluateJavaScript("window.moltenAPI.scrollToHeading(\(pos));")
     }
 

@@ -24,7 +24,7 @@
       max-width: var(--vellumi-max-width, clamp(760px, 75%, 1200px));
       min-height: 100%;
       margin: 0 auto;
-      padding: 48px 56px 40vh;
+      padding: 0 24px;
       box-sizing: border-box;
     }
     /* Typography overrides (Preferences ▸ 排印). Unset variables fall back to
@@ -37,6 +37,13 @@
     }
     .milkdown .ProseMirror {
       line-height: var(--vellumi-line-height, inherit);
+      /* Keep the blank writing area inside contenteditable so clicks place
+         the caret, rather than landing on inert outer-container padding. */
+      min-height: 100vh;
+      padding: 48px 32px 40vh;
+    }
+    .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
+      scroll-margin-top: 32px;
     }
     .milkdown .ProseMirror > p {
       margin-block: var(--vellumi-paragraph-spacing, revert);
@@ -75,7 +82,8 @@
        CodeMirror blocks the native ::selection is transparent — the visible
        selection is CM's drawn .cm-selectionBackground layer, which the theme
        styles too weakly. Use a clear accent wash for both, boosted in dark. */
-    .milkdown ::selection {
+    .milkdown .ProseMirror::selection,
+    .milkdown .ProseMirror *::selection {
       background: rgba(93, 128, 250, 0.35);
     }
     .milkdown .cm-editor .cm-selectionBackground {
@@ -85,8 +93,10 @@
       background: rgba(93, 128, 250, 0.42) !important;
     }
     @media (prefers-color-scheme: dark) {
-      .milkdown ::selection {
-        background: rgba(130, 160, 255, 0.45);
+      .milkdown .ProseMirror::selection,
+      .milkdown .ProseMirror *::selection {
+        background: #365eae;
+        color: #ffffff;
       }
       .milkdown .cm-editor .cm-selectionBackground {
         background: rgba(130, 160, 255, 0.42) !important;

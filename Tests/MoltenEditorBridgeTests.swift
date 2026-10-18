@@ -477,4 +477,102 @@ final class MoltenEditorBridgeTests: XCTestCase {
                       "text around the replacements must be untouched, got: \(markdown)")
     }
 
+    private func showEditorWindow() -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(x: -2000, y: -2000, width: 900, height: 700),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = webView
+        window.orderFrontRegardless()
+        return window
+    }
+
+    func testHeadingNavigationKeepsTargetVisibleWithTypewriter() throws {
+        try loadEditorPage()
+        let window = showEditorWindow()
+        defer { window.orderOut(nil) }
+        try setMarkdown((0..<80).map { "## 章节 \($0)\n\n正文内容。" }.joined(separator: "\n\n"))
+        _ = try evaluate("window.moltenAPI.setTypewriter(true)")
+        for index in [79, 0, 40, 79] {
+            XCTAssertEqual(try evaluate("window.moltenAPI.scrollToHeading(window.moltenAPI.getOutline()[\(index)].pos)") as? Bool, true)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+            XCTAssertEqual(try evaluate("""
+            (() => {
+              const h = document.querySelectorAll('.ProseMirror h2')[\(index)];
+              const r = h.getBoundingClientRect();
+              return r.bottom > 0 && r.top < innerHeight &&
+                h.contains(getSelection().anchorNode) &&
+                document.activeElement === document.querySelector('.ProseMirror');
+            })()
+            """) as? Bool, true, "chapter must be visible and own the caret")
+        }
+        XCTAssertEqual(try evaluate("window.moltenAPI.scrollToHeading(-1)") as? Bool, false)
+        XCTAssertEqual(try evaluate("window.moltenAPI.scrollToHeading(NaN)") as? Bool, false)
+    }
+
+    func testPointerSelectionDoesNotTriggerTypewriterScroll() throws {
+        try loadEditorPage()
+        let window = showEditorWindow()
+        defer { window.orderOut(nil) }
+        try setMarkdown(Array(repeating: "可以选取的一段文字。", count: 80).joined(separator: "\n\n"))
+        _ = try evaluate("""
+        window.moltenAPI.setTypewriter(true);
+        window.moltenAPI.setFocusMode(true);
+        window.scrollTo(0, 0);
+        document.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+        const text = document.querySelector('.ProseMirror p').firstChild;
+        const range = document.createRange();
+        range.setStart(text, 1); range.setEnd(text, 7);
+        getSelection().removeAllRanges(); getSelection().addRange(range);
+        document.dispatchEvent(new Event('selectionchange'));
+        """)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(try evaluate("window.scrollY") as? Double, 0)
+        XCTAssertEqual(try evaluate("getSelection().toString()") as? String, "以选取的一段")
+        _ = try evaluate("document.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}))")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(try evaluate("window.scrollY") as? Double, 0)
+    }
+
+    func testDarkSelectionOverridesCrepeGray() throws {
+        try loadEditorPage()
+        let window = showEditorWindow()
+        window.appearance = NSAppearance(named: .darkAqua)
+        defer { window.orderOut(nil) }
+        try setMarkdown("选中 **加粗文字** 和正文")
+        try waitUntil("matchMedia('(prefers-color-scheme: dark)').matches", description: "dark appearance")
+        for selector in [".ProseMirror p", ".ProseMirror strong"] {
+            XCTAssertEqual(try evaluate("getComputedStyle(document.querySelector('\(selector)'), '::selection').backgroundColor") as? String, "rgb(54, 94, 174)")
+            XCTAssertEqual(try evaluate("getComputedStyle(document.querySelector('\(selector)'), '::selection').color") as? String, "rgb(255, 255, 255)")
+        }
+    }
+
+    func testCachedMarkdownTracksEditsUndoAndReload() throws {
+        try loadEditorPage()
+        try setMarkdown("原始内容")
+        let before = try evaluate("window.moltenAPI.getMarkdown()") as? String
+        _ = try evaluate("window.moltenAPI.replaceAll('原始', '修改')")
+        let changed = try evaluate("window.moltenAPI.getMarkdown()") as? String
+        XCTAssertTrue(changed?.contains("修改内容") == true)
+        XCTAssertEqual(try evaluate("window.moltenAPI.getMarkdown()") as? String, changed)
+        _ = try evaluate("window.moltenAPI.undo()")
+        XCTAssertEqual(try evaluate("window.moltenAPI.getMarkdown()") as? String, before)
+        try setMarkdown("另一篇文档")
+        XCTAssertTrue((try evaluate("window.moltenAPI.getMarkdown()") as? String)?.contains("另一篇文档") == true)
+    }
+
+    func testFocusPreservesSelectionAndScroll() throws {
+        try loadEditorPage()
+        let window = showEditorWindow()
+        defer { window.orderOut(nil) }
+        try setMarkdown((0..<80).map { "## 第 \($0) 节\n\n正文内容。" }.joined(separator: "\n\n"))
+        _ = try evaluate("window.moltenAPI.scrollToHeading(window.moltenAPI.getOutline()[60].pos)")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        let offset = try evaluate("window.scrollY") as? Double
+        _ = try evaluate("window.moltenAPI.focus()")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(try evaluate("window.scrollY") as? Double, offset)
+        XCTAssertEqual(try evaluate("document.querySelectorAll('.ProseMirror h2')[60].contains(getSelection().anchorNode)") as? Bool, true)
+    }
+
 }

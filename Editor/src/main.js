@@ -165,7 +165,8 @@ function mermaidNodeView(node) {
     dom,
     update(updated) {
       if (updated.type.name !== "diagram") return false;
-      entry.render(updated.attrs.value ?? updated.textContent ?? "");
+      const code = updated.attrs.value ?? updated.textContent ?? "";
+      if (code !== entry.code) entry.render(code);
       return true;
     },
     ignoreMutation: () => true,
@@ -231,6 +232,31 @@ function inputRulesPlugin() {
 let typewriterEnabled = false;
 let focusModeEnabled = false;
 let spellcheckEnabled = false;
+let pointerSelecting = false;
+let allowTypewriterScroll = true;
+let viewModesFrame = null;
+let focusedBlock = null;
+
+// A pointer gesture owns scrolling until keyboard editing resumes. In
+// particular, never move the page underneath a drag or a newly placed caret.
+document.addEventListener("pointerdown", () => {
+  pointerSelecting = true;
+  allowTypewriterScroll = false;
+}, true);
+window.addEventListener("pointerup", () => { pointerSelecting = false; }, true);
+window.addEventListener("pointercancel", () => { pointerSelecting = false; }, true);
+window.addEventListener("blur", () => { pointerSelecting = false; });
+document.addEventListener("keydown", (event) => {
+  if (editingSurface()?.contains(event.target)) allowTypewriterScroll = true;
+}, true);
+
+function scheduleViewModes() {
+  if (viewModesFrame !== null || (!typewriterEnabled && !focusModeEnabled)) return;
+  viewModesFrame = requestAnimationFrame(() => {
+    viewModesFrame = null;
+    if (!isComposing) updateViewModes();
+  });
+}
 
 function editingSurface() {
   return root.querySelector(".ProseMirror");
@@ -248,16 +274,18 @@ function caretTopBlock() {
 function updateViewModes() {
   if (focusModeEnabled) {
     const active = caretTopBlock();
-    editingSurface()
-      ?.querySelectorAll(":scope > .vellumi-focus-active")
-      .forEach((el) => {
-        if (el !== active) el.classList.remove("vellumi-focus-active");
-      });
-    active?.classList.add("vellumi-focus-active");
+    if (focusedBlock !== active) {
+      focusedBlock?.classList.remove("vellumi-focus-active");
+      active?.classList.add("vellumi-focus-active");
+      focusedBlock = active;
+    }
   }
-  if (typewriterEnabled) {
+  if (typewriterEnabled && allowTypewriterScroll && !pointerSelecting) {
     const selection = document.getSelection();
-    if (!selection?.rangeCount) return;
+    const surface = editingSurface();
+    if (!selection?.rangeCount || !selection.isCollapsed ||
+        !surface?.contains(selection.anchorNode) ||
+        !surface.contains(document.activeElement)) return;
     const range = selection.getRangeAt(0).cloneRange();
     range.collapse(false);
     let rect = range.getBoundingClientRect();
@@ -278,9 +306,7 @@ function updateViewModes() {
 
 document.addEventListener("selectionchange", () => {
   if (isComposing) return; // never scroll under the IME candidate window
-  if (typewriterEnabled || focusModeEnabled) {
-    requestAnimationFrame(updateViewModes);
-  }
+  scheduleViewModes();
 });
 
 function applySpellcheck() {
@@ -354,9 +380,9 @@ function flushChange() {
   }
   oldestPendingChangeAt = null;
   if (!crepe) return;
-  const before = performance.now();
-  const markdown = crepe.getMarkdown();
-  const cost = performance.now() - before;
+  const markdown = currentMarkdown();
+  // A cache hit must not reset the throttle for a costly document.
+  const cost = serializationCostMS;
   // 10x the serialize cost, floored at the base cadence: a 1ms doc keeps the
   // snappy 150ms; a 60ms doc backs off to 600ms and stops eating keystrokes.
   changeDebounceMS = Math.min(2000, Math.max(CHANGE_DEBOUNCE_MS, cost * 10));
@@ -433,6 +459,9 @@ function rewriteAssetURL(url) {
 
 async function createEditor(markdown) {
   const generation = ++loadGeneration;
+  serializedDoc = null;
+  serializedMarkdown = null;
+  focusedBlock = null;
   // A timer armed against the outgoing editor must not fire into the new one
   // with pre-load content (it would resurrect reverted-away edits).
   clearTimeout(changeTimer);
@@ -502,7 +531,7 @@ async function createEditor(markdown) {
   // Baseline against the SERIALIZED form, not the raw input: the serializer
   // normalizes (list markers, blank lines), and that echo must not count as
   // an edit — otherwise every document opens already dirty.
-  lastSentMarkdown = next.getMarkdown();
+  lastSentMarkdown = currentMarkdown();
   // Typora-style normalization is a documented tradeoff — surface it so the
   // shell can show a one-time notice (source mode shows the original).
   // Carries the serialized text so the shell can adopt it as the clean
@@ -515,10 +544,25 @@ async function createEditor(markdown) {
 }
 
 function focusEditor() {
-  // AppKit gives the WKWebView first-responder status, but typing only lands
-  // once the contenteditable itself has DOM focus.
-  requestAnimationFrame(() => {
-    root.querySelector(".ProseMirror")?.focus();
+  // ProseMirror restores its own selection without the browser's default
+  // focus scroll. A delayed DOM focus can overwrite a later pointer gesture.
+  crepe?.editor.action((ctx) => ctx.get(editorViewCtx).focus());
+}
+
+let serializedDoc = null;
+let serializedMarkdown = null;
+let serializationCostMS = 0;
+function currentMarkdown() {
+  if (!crepe) return null;
+  return crepe.editor.action((ctx) => {
+    const doc = ctx.get(editorViewCtx).state.doc;
+    if (doc !== serializedDoc) {
+      const started = performance.now();
+      serializedMarkdown = crepe.getMarkdown();
+      serializationCostMS = performance.now() - started;
+      serializedDoc = doc;
+    }
+    return serializedMarkdown;
   });
 }
 
@@ -534,7 +578,7 @@ window.moltenAPI = {
     // return null so the shell keeps its current text. Returning "" here
     // once let a save during the window truncate the document to zero bytes.
     if (!crepe) return null;
-    const markdown = crepe.getMarkdown();
+    const markdown = currentMarkdown();
     lastSentMarkdown = markdown;
     return markdown;
   },
@@ -650,13 +694,24 @@ window.moltenAPI = {
     return outline;
   },
   scrollToHeading(pos) {
-    if (!crepe || typeof pos !== "number") return;
-    crepe.editor.action((ctx) => {
+    if (!crepe || !Number.isInteger(pos)) return false;
+    return crepe.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx);
-      const clamped = Math.max(0, Math.min(pos + 1, view.state.doc.content.size));
-      const selection = TextSelection.near(view.state.doc.resolve(clamped));
-      view.dispatch(view.state.tr.setSelection(selection).scrollIntoView());
+      if (pos < 0 || pos >= view.state.doc.content.size ||
+          view.state.doc.nodeAt(pos)?.type.name !== "heading") return false;
+      allowTypewriterScroll = false;
+      const selection = TextSelection.near(view.state.doc.resolve(pos + 1));
+      view.dispatch(view.state.tr.setSelection(selection));
       view.focus();
+      // Scroll the actual heading, not a transient DOM selection rectangle.
+      // WebKit may report that rectangle at the old caret after focus moves
+      // from the native sidebar. Typewriter centering must not race this.
+      const heading = view.nodeDOM(pos);
+      if (heading instanceof Element) {
+        heading.scrollIntoView({ block: "start", behavior: "instant" });
+      }
+      scheduleViewModes();
+      return true;
     });
   },
   // Native find bar drives WebKit's window.find (selection-based, wraps).
@@ -910,7 +965,7 @@ window.moltenAPI = {
     if (changeTimer) flushChange();
     smartPunctuationEnabled = next;
     if (crepe) {
-      const markdown = crepe.getMarkdown();
+      const markdown = currentMarkdown();
       lastSentMarkdown = markdown;
       window.moltenAPI.setMarkdown(markdown);
     }
@@ -936,9 +991,8 @@ window.moltenAPI = {
     if (focusModeEnabled) {
       updateViewModes();
     } else {
-      editingSurface()
-        ?.querySelectorAll(".vellumi-focus-active")
-        .forEach((el) => el.classList.remove("vellumi-focus-active"));
+      focusedBlock?.classList.remove("vellumi-focus-active");
+      focusedBlock = null;
     }
   },
   setSpellcheck(on) {

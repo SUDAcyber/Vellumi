@@ -87,12 +87,21 @@ final class MoltenPerformanceMeasurementTests: XCTestCase {
             try waitUntil("window.moltenAPI.getMarkdown() !== null", what: "editor built (\(lineCount) lines)")
             let loadMS = Date().timeIntervalSince(loadStart) * 1000
 
-            // Serialization is what runs on EVERY debounce flush while typing.
+            // Measure a changed document separately from repeated cached reads.
             let serializeMS = try XCTUnwrap(try evaluate("""
             (() => {
               const t0 = performance.now();
-              for (let i = 0; i < 5; i += 1) window.moltenAPI.getMarkdown();
-              return (performance.now() - t0) / 5;
+              window.moltenAPI.setHeading(1);
+              window.moltenAPI.getMarkdown();
+              return performance.now() - t0;
+            })()
+            """) as? Double)
+
+            let cachedMS = try XCTUnwrap(try evaluate("""
+            (() => {
+              const t0 = performance.now();
+              for (let i = 0; i < 20; i++) window.moltenAPI.getMarkdown();
+              return (performance.now() - t0) / 20;
             })()
             """) as? Double)
 
@@ -112,8 +121,8 @@ final class MoltenPerformanceMeasurementTests: XCTestCase {
 
             let bytes = markdown.utf8.count
             print(String(
-                format: "PERF | %5d 行 | %6.1f KB | 打开 %7.0f ms | 序列化 %6.1f ms | 大纲 %5.1f ms | 字数 %5.1f ms",
-                lineCount, Double(bytes) / 1024, loadMS, serializeMS, outlineMS, countMS
+                format: "PERF | %5d 行 | %6.1f KB | 打开 %7.0f ms | 编辑并序列化 %6.1f ms | 缓存 %5.2f ms | 大纲 %5.1f ms | 字数 %5.1f ms",
+                lineCount, Double(bytes) / 1024, loadMS, serializeMS, cachedMS, outlineMS, countMS
             ))
 
             // Only a catastrophic regression should fail the suite.
