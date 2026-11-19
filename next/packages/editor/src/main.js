@@ -1,0 +1,1009 @@
+// Molten editing surface.
+//
+// A Milkdown Crepe editor (ProseMirror under the hood) fills the window and
+// gives the Typora-style "melting" feel: markdown syntax fuses into rendered
+// typography as you type. The native Swift shell owns the file; this side owns
+// the editing session and reports serialized markdown back over the bridge.
+//
+// Bridge contract (keep in sync with MoltenEditorViewController.swift):
+//   JS → Swift  window.webkit.messageHandlers.molten.postMessage(…)
+//     {type: "ready"}                       surface booted, safe to setMarkdown
+//     {type: "change", markdown: String}    debounced content update
+//     {type: "boot-error", message: String} editor failed to construct
+//     {type: "image-save", id, name, base64} pasted/dropped image payload;
+//                       Swift answers via moltenAPI.resolveImageSave(id, path)
+//   Swift → JS  window.moltenAPI.*
+//     setMarkdown(md)   load document content (builds/rebuilds the editor)
+//     getMarkdown()     current serialization, or null while no editor is
+//                       live (booting/rebuilding) — callers must treat null
+//                       as "keep what you already have", never as empty
+//     undo()/redo()     forward native menu actions to ProseMirror history
+//     focus()           re-assert DOM focus once the host window is key
+//     getOutline()      [{level, text, pos}] for the native outline sidebar
+//     scrollToHeading(pos)  move caret to a heading and scroll it into view
+//     search({text, caseSensitive, wholeWord, regex}) / searchStep(backwards)
+//                       / clearSearch()   → {total, current}   (search.js)
+//     replaceCurrent(replacement) / replaceAll(replacement)  find-bar replace
+//     getContentHTML()  cleaned rendered HTML for export (null before boot)
+//
+// The editor is constructed lazily on the first setMarkdown — building a
+// throwaway empty editor at boot would double every document-open.
+
+import { Crepe } from "@milkdown/crepe";
+import { editorViewCtx } from "@milkdown/core";
+import mermaid from "mermaid";
+import { undoCommand, redoCommand } from "@milkdown/plugin-history";
+import {
+  insertHrCommand,
+  toggleLinkCommand,
+  toggleEmphasisCommand,
+  toggleInlineCodeCommand,
+  toggleStrongCommand,
+  turnIntoTextCommand,
+  wrapInBlockquoteCommand,
+  wrapInBulletListCommand,
+  wrapInHeadingCommand,
+  wrapInOrderedListCommand,
+} from "@milkdown/preset-commonmark";
+import { toggleStrikethroughCommand, columnResizingPlugin } from "@milkdown/preset-gfm";
+import { diagram, diagramSchema } from "@milkdown/plugin-diagram";
+import { TextSelection } from "@milkdown/prose/state";
+import { InputRule, inputRules, smartQuotes, ellipsis, emDash } from "@milkdown/prose/inputrules";
+import { callCommand, $prose, $view } from "@milkdown/utils";
+import { languages as codeLanguages } from "@codemirror/language-data";
+import { gemoji } from "gemoji";
+import { installFidelity } from "./fidelity.js";
+import { searchCommands, searchPlugin } from "./search.js";
+import { blockSelectionPlugin } from "./selection.js";
+import { buildToolbar, labelToolbar, toolbarIcons } from "./toolbar.js";
+import "@milkdown/crepe/theme/common/style.css";
+// Frame theme ships as separate light/dark files (each redefines the same
+// variables), so they are built as standalone stylesheets and index.html
+// swaps them via prefers-color-scheme media queries.
+
+// Trailing debounce for change messages, with a max-latency bound: a fluent
+// typist never pausing 150ms must still flush at least once per second, or
+// Swift's copy (autosave, crash recovery) goes unboundedly stale.
+// ---- Editor-surface localization -----------------------------------------
+// Crepe's built-in strings (slash menu, placeholders, image upload buttons)
+// are English; mirror the app's zh-Hans localization when the SYSTEM language
+// is Chinese (navigator.language follows the host system in WKWebView).
+const appLanguage = typeof window.__vellumiLanguage === "string" ? window.__vellumiLanguage : "";
+const isChinese = /^zh\b/i.test(appLanguage || navigator.language || "");
+
+const zhBlockEdit = {
+  textGroup: {
+    label: "文本",
+    text: { label: "正文" },
+    h1: { label: "标题 1" },
+    h2: { label: "标题 2" },
+    h3: { label: "标题 3" },
+    h4: { label: "标题 4" },
+    h5: { label: "标题 5" },
+    h6: { label: "标题 6" },
+    quote: { label: "引用" },
+    divider: { label: "分隔线" },
+  },
+  listGroup: {
+    label: "列表",
+    bulletList: { label: "无序列表" },
+    orderedList: { label: "有序列表" },
+    taskList: { label: "待办列表" },
+  },
+  advancedGroup: {
+    label: "高级",
+    image: { label: "图片" },
+    codeBlock: { label: "代码块" },
+    table: { label: "表格" },
+    math: { label: "数学公式" },
+  },
+};
+
+const zhImageBlock = {
+  inlineUploadButton: "上传",
+  inlineUploadPlaceholderText: "或粘贴图片链接…",
+  inlineConfirmButton: "确认",
+  blockUploadButton: "上传图片",
+  blockUploadPlaceholderText: "或粘贴图片链接…",
+  blockConfirmButton: "确认",
+  blockCaptionPlaceholderText: "图片说明",
+};
+
+function localizedFeatureConfigs() {
+  if (!isChinese) return {};
+  return {
+    [Crepe.Feature.BlockEdit]: zhBlockEdit,
+    [Crepe.Feature.Placeholder]: { text: "输入正文,或按 / 唤起命令…" },
+  };
+}
+// ---------------------------------------------------------------------------
+
+// ---- Mermaid rendering -----------------------------------------------------
+// plugin-diagram (7.7) supplies the schema/remark mapping for ```mermaid
+// fences, but its NodeView predates Crepe 7.21 and never installs — so we
+// provide our own: a plain ProseMirror nodeView that renders the source
+// through mermaid and falls back to raw text when the graph doesn't parse.
+// Editing the source happens in source mode (⌘/); the node itself is atomic.
+const liveMermaidViews = new Set();
+let mermaidSeq = 0;
+
+function mermaidTheme() {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default";
+}
+
+mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: mermaidTheme() });
+
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: mermaidTheme() });
+  liveMermaidViews.forEach((entry) => entry.render(entry.code));
+});
+
+function mermaidNodeView(node) {
+  const dom = document.createElement("div");
+  dom.className = "vellumi-mermaid";
+  dom.setAttribute("contenteditable", "false");
+  const entry = {
+    code: "",
+    render(code) {
+      entry.code = code;
+      if (!code.trim()) {
+        dom.textContent = "";
+        return;
+      }
+      const id = `vellumi-mermaid-${++mermaidSeq}`;
+      mermaid
+        .render(id, code)
+        .then(({ svg }) => {
+          if (entry.code === code) dom.innerHTML = svg;
+        })
+        .catch(() => {
+          // Invalid graph source: show it verbatim (mermaid may leave a
+          // scratch element behind on failure — remove it).
+          document.getElementById(`d${id}`)?.remove();
+          if (entry.code === code) dom.textContent = code;
+        });
+    },
+  };
+  liveMermaidViews.add(entry);
+  entry.render(node.attrs.value ?? node.textContent ?? "");
+  return {
+    dom,
+    update(updated) {
+      if (updated.type.name !== "diagram") return false;
+      const code = updated.attrs.value ?? updated.textContent ?? "";
+      if (code !== entry.code) entry.render(code);
+      return true;
+    },
+    ignoreMutation: () => true,
+    destroy() {
+      liveMermaidViews.delete(entry);
+    },
+  };
+}
+// -----------------------------------------------------------------------------
+
+// Position-safe case-insensitive matching. Compares SLICES of the original
+// string (never indexes into a folded copy), so length-changing case folds
+// (U+0130) cannot skew offsets. Matches are the equal-code-unit-length subset,
+// which is exactly what a ProseMirror range replacement can express.
+function caseInsensitiveRanges(text, term) {
+  const matches = [];
+  if (!term || term.length > text.length) return matches;
+  const needle = term.toLowerCase();
+  let index = 0;
+  const limit = text.length - term.length;
+  while (index <= limit) {
+    if (text.substr(index, term.length).toLowerCase() === needle) {
+      matches.push({ start: index, end: index + term.length });
+      index += term.length;
+    } else {
+      index += 1;
+    }
+  }
+  return matches;
+}
+
+// ---- Smart punctuation & emoji completion ----------------------------------
+// Smart punctuation (curly quotes, …, —) uses the stock ProseMirror rules;
+// it is baked in at editor construction, so toggling rebuilds the editor
+// (rare event, acceptable history reset). Emoji :name: completion is always
+// on — it only fires on the exact :shortcode: form.
+let smartPunctuationEnabled = false;
+
+const emojiByName = new Map();
+for (const entry of gemoji) {
+  for (const name of entry.names) emojiByName.set(name, entry.emoji);
+}
+
+const emojiRule = new InputRule(/:([a-zA-Z0-9_+-]+):$/, (state, match, start, end) => {
+  const emoji = emojiByName.get(match[1]);
+  return emoji ? state.tr.insertText(emoji, start, end) : null;
+});
+
+function inputRulesPlugin() {
+  const rules = [emojiRule];
+  if (smartPunctuationEnabled) {
+    rules.push(...smartQuotes, ellipsis, emDash);
+  }
+  return $prose(() => inputRules({ rules }));
+}
+// -----------------------------------------------------------------------------
+
+// ---- View modes -----------------------------------------------------------
+// Typewriter: keep the caret line vertically anchored (~45% of the viewport)
+// while typing/navigating. Focus: dim every top-level block except the one
+// holding the caret. Both are driven off selectionchange — it fires for
+// typing AND caret movement, which is exactly the trigger set we want.
+let typewriterEnabled = false;
+let focusModeEnabled = false;
+let spellcheckEnabled = false;
+let pointerSelecting = false;
+let allowTypewriterScroll = true;
+let viewModesFrame = null;
+let focusedBlock = null;
+
+// A pointer gesture owns scrolling until keyboard editing resumes. In
+// particular, never move the page underneath a drag or a newly placed caret.
+document.addEventListener("pointerdown", () => {
+  pointerSelecting = true;
+  allowTypewriterScroll = false;
+}, true);
+window.addEventListener("pointerup", () => { pointerSelecting = false; }, true);
+window.addEventListener("pointercancel", () => { pointerSelecting = false; }, true);
+window.addEventListener("blur", () => { pointerSelecting = false; });
+document.addEventListener("keydown", (event) => {
+  if (editingSurface()?.contains(event.target)) allowTypewriterScroll = true;
+}, true);
+
+function scheduleViewModes() {
+  if (viewModesFrame !== null || (!typewriterEnabled && !focusModeEnabled)) return;
+  viewModesFrame = requestAnimationFrame(() => {
+    viewModesFrame = null;
+    if (!isComposing) updateViewModes();
+  });
+}
+
+function editingSurface() {
+  return root.querySelector(".ProseMirror");
+}
+
+function caretTopBlock() {
+  const surface = editingSurface();
+  const selection = document.getSelection();
+  let node = selection?.anchorNode;
+  if (!surface || !node || !surface.contains(node)) return null;
+  while (node.parentNode && node.parentNode !== surface) node = node.parentNode;
+  return node instanceof Element ? node : null;
+}
+
+function updateViewModes() {
+  if (focusModeEnabled) {
+    const active = caretTopBlock();
+    if (focusedBlock !== active) {
+      focusedBlock?.classList.remove("vellumi-focus-active");
+      active?.classList.add("vellumi-focus-active");
+      focusedBlock = active;
+    }
+  }
+  if (typewriterEnabled && allowTypewriterScroll && !pointerSelecting) {
+    const selection = document.getSelection();
+    const surface = editingSurface();
+    if (!selection?.rangeCount || !selection.isCollapsed ||
+        !surface?.contains(selection.anchorNode) ||
+        !surface.contains(document.activeElement)) return;
+    const range = selection.getRangeAt(0).cloneRange();
+    range.collapse(false);
+    let rect = range.getBoundingClientRect();
+    if (!rect || (rect.height === 0 && rect.top === 0)) {
+      const container = range.startContainer;
+      const el = container instanceof Element ? container : container.parentElement;
+      rect = el?.getBoundingClientRect();
+    }
+    if (!rect) return;
+    const delta = rect.top - window.innerHeight * 0.45;
+    // Dead zone: without it every keystroke micro-scrolls by sub-pixel
+    // amounts and the page shimmers.
+    if (Math.abs(delta) > 4) {
+      window.scrollBy({ top: delta, behavior: "auto" });
+    }
+  }
+}
+
+document.addEventListener("selectionchange", () => {
+  if (isComposing) return; // never scroll under the IME candidate window
+  scheduleViewModes();
+});
+
+function applySpellcheck() {
+  editingSurface()?.setAttribute("spellcheck", spellcheckEnabled ? "true" : "false");
+}
+// ---------------------------------------------------------------------------
+
+// ---- IME composition guard --------------------------------------------------
+// During pinyin (etc.) composition the DOM holds transient candidate text.
+// Serializing then costs main-thread time in the IME's critical path AND can
+// capture half-composed garbage; typewriter scrolling mid-composition makes
+// the candidate window chase the caret. Both wait for compositionend.
+let isComposing = false;
+document.addEventListener("compositionstart", () => {
+  isComposing = true;
+});
+document.addEventListener("compositionend", () => {
+  isComposing = false;
+  scheduleChange();
+});
+// -----------------------------------------------------------------------------
+
+const CHANGE_DEBOUNCE_MS = 150;
+const CHANGE_MAX_LATENCY_MS = 1000;
+// Adaptive throttle: large documents serialize slowly; measuring the actual
+// cost and scaling the debounce keeps typing latency flat instead of paying
+// a fixed 150ms cadence on a 10k-line file.
+let changeDebounceMS = CHANGE_DEBOUNCE_MS;
+let changeMaxLatencyMS = CHANGE_MAX_LATENCY_MS;
+
+const root = document.getElementById("editor");
+// Tooltips/labels for the floating toolbar, which is rebuilt with the editor.
+labelToolbar(root, isChinese);
+let crepe = null;
+let changeTimer = null;
+let oldestPendingChangeAt = null;
+let lastSentMarkdown = null;
+// Guards the async rebuild in setMarkdown: a stale create() must not clobber
+// a newer document load.
+let loadGeneration = 0;
+// Scroll restore across editor rebuilds (source-mode round trip): applied
+// after the next createEditor completes, or immediately when idle.
+let pendingScrollFraction = null;
+
+function applyPendingScroll() {
+  if (pendingScrollFraction === null) return;
+  const fraction = pendingScrollFraction;
+  pendingScrollFraction = null;
+  requestAnimationFrame(() => {
+    const max = document.documentElement.scrollHeight - window.innerHeight;
+    window.scrollTo({ top: fraction * Math.max(0, max), behavior: "auto" });
+  });
+}
+
+// Host transport. The Tauri shell injects window.__vellumiPost at document
+// start; the legacy WKWebView handler stays as a fallback.
+function post(message) {
+  try {
+    if (typeof window.__vellumiPost === "function") {
+      window.__vellumiPost(message);
+      return;
+    }
+    window.webkit?.messageHandlers?.molten?.postMessage(message);
+  } catch {
+    // Running outside the shell (e.g. opened in a browser for debugging).
+  }
+}
+
+// Serialization happens HERE, once per flush — not per keystroke. The editor
+// listener only marks dirty; a large document is stringified when the timer
+// fires, not on every transaction.
+function flushChange() {
+  clearTimeout(changeTimer);
+  changeTimer = null;
+  if (isComposing) {
+    // Never serialize mid-composition; compositionend reschedules.
+    changeTimer = setTimeout(flushChange, changeDebounceMS);
+    return;
+  }
+  oldestPendingChangeAt = null;
+  if (!crepe) return;
+  const markdown = currentMarkdown();
+  // A cache hit must not reset the throttle for a costly document.
+  const cost = serializationCostMS;
+  // 10x the serialize cost, floored at the base cadence: a 1ms doc keeps the
+  // snappy 150ms; a 60ms doc backs off to 600ms and stops eating keystrokes.
+  changeDebounceMS = Math.min(2000, Math.max(CHANGE_DEBOUNCE_MS, cost * 10));
+  changeMaxLatencyMS = Math.min(3000, Math.max(CHANGE_MAX_LATENCY_MS, cost * 40));
+  if (markdown !== lastSentMarkdown) {
+    lastSentMarkdown = markdown;
+    post({ type: "change", markdown });
+  }
+}
+
+function scheduleChange() {
+  const now = Date.now();
+  oldestPendingChangeAt ??= now;
+  if (now - oldestPendingChangeAt >= changeMaxLatencyMS) {
+    flushChange();
+    return;
+  }
+  clearTimeout(changeTimer);
+  changeTimer = setTimeout(flushChange, changeDebounceMS);
+}
+
+// ---- Image save pipeline -------------------------------------------------
+// Pasted/dropped images go to Swift (which owns sandbox permissions and the
+// document's folder) and come back as a document-relative path like
+// "assets/pic.png". Display-time, relative srcs are rewritten to the
+// molten-asset:// scheme served by the shell.
+
+// Display-time prefix for document-relative images; the host serves it.
+const ASSET_BASE =
+  typeof window.__vellumiAssetBase === "string" ? window.__vellumiAssetBase : "molten-asset://asset/";
+
+const pendingImageSaves = new Map();
+let imageSaveCounter = 0;
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 0x8000; // keep String.fromCharCode argument counts sane
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+// The text path has maximumFileSize (20 MB); the image path had no ceiling at
+// all, so pasting a 60 MB original stalled the editor and spiked memory.
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+
+async function uploadImage(file) {
+  if (typeof file?.size === "number" && file.size > MAX_IMAGE_BYTES) {
+    throw new Error(
+      isChinese
+        ? "图片太大(超过 32 MB),请先压缩后再插入。"
+        : "Image is larger than 32 MB — please compress it before inserting."
+    );
+  }
+  const base64 = arrayBufferToBase64(await file.arrayBuffer());
+  const id = ++imageSaveCounter;
+  return new Promise((resolve, reject) => {
+    pendingImageSaves.set(id, { resolve, reject });
+    post({ type: "image-save", id, name: file.name || "image.png", base64 });
+    // No unilateral timeout: this timer runs in a separate process from the
+    // app's modal run loop, so a first-time folder-authorization panel that
+    // the user leaves open for a while used to make JS give up while Swift
+    // still went on to write the file — an orphan on disk and no image in the
+    // document. Swift always answers via resolveImageSave; the only way this
+    // promise stays pending is an editor teardown, which discards it anyway.
+  });
+}
+
+function rewriteAssetURL(url) {
+  if (typeof url !== "string" || !url) return url;
+  // Absolute/self-describing URLs pass through untouched.
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/)/i.test(url)) return url;
+  return `${ASSET_BASE}${encodeURI(url)}`;
+}
+// ---------------------------------------------------------------------------
+
+async function createEditor(markdown) {
+  const generation = ++loadGeneration;
+  serializedDoc = null;
+  serializedMarkdown = null;
+  focusedBlock = null;
+  // A timer armed against the outgoing editor must not fire into the new one
+  // with pre-load content (it would resurrect reverted-away edits).
+  clearTimeout(changeTimer);
+  changeTimer = null;
+  oldestPendingChangeAt = null;
+
+  if (crepe) {
+    const old = crepe;
+    crepe = null;
+    try {
+      await old.destroy();
+    } catch {
+      // A half-initialized editor may throw on teardown; the replaced DOM
+      // subtree is cleared below either way.
+    }
+  }
+  if (generation !== loadGeneration) return;
+  root.replaceChildren();
+
+  const next = new Crepe({
+    root,
+    defaultValue: markdown,
+    featureConfigs: {
+      ...localizedFeatureConfigs(),
+      // Full CodeMirror language registry: real syntax highlighting plus a
+      // useful searchable language picker (the default set is EMPTY).
+      [Crepe.Feature.CodeMirror]: {
+        languages: codeLanguages,
+      },
+      // Floating format toolbar as in the design (toolbar.js).
+      [Crepe.Feature.Toolbar]: {
+        ...toolbarIcons,
+        buildToolbar,
+      },
+      [Crepe.Feature.ImageBlock]: {
+        onUpload: uploadImage,
+        inlineOnUpload: uploadImage,
+        blockOnUpload: uploadImage,
+        proxyDomURL: rewriteAssetURL,
+        ...(isChinese ? zhImageBlock : {}),
+      },
+    },
+  });
+  // Mermaid: plugin-diagram for schema/serialization, our nodeView for the
+  // actual rendering (see mermaidNodeView above). Registered as a $view
+  // plugin — NEVER via editorViewOptionsCtx.nodeViews, which REPLACES the
+  // nodeViews milkdown gathers from components and silently disables the
+  // code block / image block / list item / table UIs.
+  next.editor.use(diagram);
+  next.editor.use($view(diagramSchema.node, () => (node) => mermaidNodeView(node)));
+  // Table column-width dragging (prosemirror-tables columnResizing). Exported
+  // by preset-gfm but NOT in its composed plugin list — opt in explicitly.
+  next.editor.use(columnResizingPlugin);
+  next.editor.use(inputRulesPlugin());
+  next.editor.use(searchPlugin);
+  next.editor.use(blockSelectionPlugin);
+  // Content-preserving overrides for Crepe's serializer (see fidelity.js).
+  installFidelity(next.editor, markdown);
+  next.on((listener) => {
+    // `updated` fires per transaction WITHOUT serializing; markdown is pulled
+    // lazily in flushChange.
+    listener.updated(() => {
+      if (next === crepe) {
+        scheduleChange();
+      }
+    });
+  });
+  await next.create();
+  if (generation !== loadGeneration) {
+    try {
+      await next.destroy();
+    } catch {}
+    return;
+  }
+  crepe = next;
+  // Baseline against the SERIALIZED form, not the raw input: the serializer
+  // normalizes (list markers, blank lines), and that echo must not count as
+  // an edit — otherwise every document opens already dirty.
+  lastSentMarkdown = currentMarkdown();
+  // Typora-style normalization is a documented tradeoff — surface it so the
+  // shell can show a one-time notice (source mode shows the original).
+  // Carries the serialized text so the shell can adopt it as the clean
+  // baseline: without it, the first pull always differed from what was read
+  // off disk and silently dirtied (then rewrote) untouched files.
+  post({ type: "normalized", changed: lastSentMarkdown !== markdown, markdown: lastSentMarkdown });
+  applySpellcheck();
+  if (lastSearchQuery) withView((view) => searchCommands.setQuery(view, lastSearchQuery));
+  focusEditor();
+  applyPendingScroll();
+}
+
+// Runs `fn(view)` against the live editor; undefined while none exists.
+function withView(fn) {
+  if (!crepe) return undefined;
+  return crepe.editor.action((ctx) => fn(ctx.get(editorViewCtx)));
+}
+
+// The find bar's query survives editor rebuilds (source-mode round trip,
+// external reload) so highlights come back with the new content.
+let lastSearchQuery = null;
+
+function focusEditor() {
+  // ProseMirror restores its own selection without the browser's default
+  // focus scroll. A delayed DOM focus can overwrite a later pointer gesture.
+  crepe?.editor.action((ctx) => ctx.get(editorViewCtx).focus());
+}
+
+let serializedDoc = null;
+let serializedMarkdown = null;
+let serializationCostMS = 0;
+function currentMarkdown() {
+  if (!crepe) return null;
+  return crepe.editor.action((ctx) => {
+    const doc = ctx.get(editorViewCtx).state.doc;
+    if (doc !== serializedDoc) {
+      const started = performance.now();
+      serializedMarkdown = crepe.getMarkdown();
+      serializationCostMS = performance.now() - started;
+      serializedDoc = doc;
+    }
+    return serializedMarkdown;
+  });
+}
+
+window.moltenAPI = {
+  setMarkdown(markdown) {
+    createEditor(typeof markdown === "string" ? markdown : "").catch((error) => {
+      window.__moltenBootError = String(error?.stack ?? error);
+      post({ type: "boot-error", message: String(error) });
+    });
+  },
+  getMarkdown() {
+    // No live editor (booting, or mid-rebuild between destroy and create):
+    // return null so the shell keeps its current text. Returning "" here
+    // once let a save during the window truncate the document to zero bytes.
+    if (!crepe) return null;
+    const markdown = currentMarkdown();
+    lastSentMarkdown = markdown;
+    return markdown;
+  },
+  // Called when the hosting window becomes ready: the editor may finish
+  // building BEFORE the window is key, in which case the DOM focus set at
+  // construction time doesn't stick and typing goes nowhere.
+  focus() {
+    focusEditor();
+  },
+  // Theme selection: swap the light/dark stylesheet pair; prefers-color-scheme
+  // still decides which of the two applies.
+  setTheme(name) {
+    const valid = ["frame", "nord", "classic"];
+    const theme = valid.includes(name) ? name : "frame";
+    // Swap-on-load: setting href directly unloads the old sheet before the
+    // new one has parsed → one unstyled flash frame. Instead insert the new
+    // link, let it load, then retire the old one.
+    for (const mode of ["light", "dark"]) {
+      const id = `theme-${mode}`;
+      const old = document.getElementById(id);
+      const href = `themes/${theme}-${mode}.css`;
+      if (!old || old.getAttribute("href") === href) continue;
+      const fresh = old.cloneNode(false);
+      fresh.setAttribute("href", href);
+      fresh.addEventListener("load", () => old.remove(), { once: true });
+      // Safety: if load never fires (missing file), don't leave both active.
+      setTimeout(() => old.remove(), 500);
+      old.id = "";
+      fresh.id = id;
+      old.parentNode.insertBefore(fresh, old.nextSibling);
+    }
+  },
+  // Native Edit ▸ Undo/Redo menu items forward here — WKWebView exposes no
+  // responder-chain undo, and ProseMirror's history is the real stack.
+  undo() {
+    crepe?.editor.action(callCommand(undoCommand.key));
+  },
+  redo() {
+    crepe?.editor.action(callCommand(redoCommand.key));
+  },
+  // Format menu commands (⌘1–6, ⌘0, ⌘B/I/E, ⌘⇧X, ⌘⇧U/O, ⌘⇧Q, ⌥⌘-).
+  // Focus first: menu clicks move AppKit focus off the contenteditable, and a
+  // ProseMirror command without a live selection silently no-ops.
+  setHeading(level) {
+    if (!crepe) return;
+    focusEditor();
+    const clamped = Math.max(0, Math.min(6, Number(level) || 0));
+    if (clamped === 0) {
+      crepe.editor.action(callCommand(turnIntoTextCommand.key));
+    } else {
+      crepe.editor.action(callCommand(wrapInHeadingCommand.key, clamped));
+    }
+  },
+  toggleBold() {
+    focusEditor();
+    crepe?.editor.action(callCommand(toggleStrongCommand.key));
+  },
+  toggleItalic() {
+    focusEditor();
+    crepe?.editor.action(callCommand(toggleEmphasisCommand.key));
+  },
+  toggleInlineCode() {
+    focusEditor();
+    crepe?.editor.action(callCommand(toggleInlineCodeCommand.key));
+  },
+  toggleStrikethrough() {
+    focusEditor();
+    crepe?.editor.action(callCommand(toggleStrikethroughCommand.key));
+  },
+  toggleBlockquote() {
+    focusEditor();
+    crepe?.editor.action(callCommand(wrapInBlockquoteCommand.key));
+  },
+  toggleBulletList() {
+    focusEditor();
+    crepe?.editor.action(callCommand(wrapInBulletListCommand.key));
+  },
+  toggleOrderedList() {
+    focusEditor();
+    crepe?.editor.action(callCommand(wrapInOrderedListCommand.key));
+  },
+  insertHorizontalRule() {
+    focusEditor();
+    crepe?.editor.action(callCommand(insertHrCommand.key));
+  },
+  // ⌘K: wrap the selection in a link (empty href pops Crepe's link tooltip
+  // for the URL); on an existing link it unwraps.
+  toggleLink() {
+    focusEditor();
+    crepe?.editor.action(callCommand(toggleLinkCommand.key, { href: "" }));
+  },
+  // Headings for the native outline sidebar. Walking the ProseMirror tree is
+  // cheap relative to serialization; positions are document offsets usable
+  // with scrollToHeading below.
+  getOutline() {
+    if (!crepe) return [];
+    const outline = [];
+    crepe.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      view.state.doc.descendants((node, pos) => {
+        // Headings are block nodes; returning false for non-blocks stops
+        // ProseMirror from recursing into every inline node of every paragraph.
+        if (!node.isBlock) return false;
+        if (node.type.name === "heading") {
+          outline.push({
+            level: Number(node.attrs.level ?? 1),
+            text: node.textContent,
+            pos,
+          });
+        }
+      });
+    });
+    return outline;
+  },
+  scrollToHeading(pos) {
+    if (!crepe || !Number.isInteger(pos)) return false;
+    return crepe.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      if (pos < 0 || pos >= view.state.doc.content.size ||
+          view.state.doc.nodeAt(pos)?.type.name !== "heading") return false;
+      allowTypewriterScroll = false;
+      const selection = TextSelection.near(view.state.doc.resolve(pos + 1));
+      view.dispatch(view.state.tr.setSelection(selection));
+      view.focus();
+      // Scroll the actual heading, not a transient DOM selection rectangle.
+      // WebKit may report that rectangle at the old caret after focus moves
+      // from the native sidebar. Typewriter centering must not race this.
+      const heading = view.nodeDOM(pos);
+      if (heading instanceof Element) {
+        heading.scrollIntoView({ block: "start", behavior: "instant" });
+      }
+      scheduleViewModes();
+      return true;
+    });
+  },
+  // Find (search.js): query = {text, caseSensitive, wholeWord, regex}.
+  // Returns {total, current} (current is 1-based, 0 = none).
+  search(query) {
+    lastSearchQuery = query && query.text ? query : null;
+    return withView((view) => searchCommands.setQuery(view, query)) ?? { total: 0, current: 0 };
+  },
+  searchStep(backwards) {
+    return withView((view) => searchCommands.step(view, Boolean(backwards))) ?? { total: 0, current: 0 };
+  },
+  searchState() {
+    return withView((view) => searchCommands.state(view)) ?? { total: 0, current: 0 };
+  },
+  // Closing the find bar drops the highlights.
+  clearSearch() {
+    lastSearchQuery = null;
+    withView((view) => searchCommands.clear(view));
+  },
+  // Clean document HTML for export: the rendered ProseMirror subtree with
+  // editing chrome stripped and molten-asset:// srcs restored to the
+  // document-relative paths the exported file should reference.
+  getContentHTML() {
+    const surface = root.querySelector(".ProseMirror");
+    if (!crepe || !surface) return null;
+    const clone = surface.cloneNode(true);
+    clone.removeAttribute("contenteditable");
+    clone.removeAttribute("translate");
+    clone.querySelectorAll("[contenteditable]").forEach((el) => el.removeAttribute("contenteditable"));
+    // Editing-only artifacts: widget decorations, drop cursors, placeholders.
+    clone
+      .querySelectorAll(
+        ".ProseMirror-widget, .milkdown-block-handle, .crepe-placeholder, [data-crepe-placeholder]," +
+          // Caret / drop / gap cursors drawn as elements (Crepe's virtual
+          // cursor became an empty first image card).
+          " .prosemirror-virtual-cursor, .ProseMirror-gapcursor, .prosemirror-dropcursor-block, .prosemirror-dropcursor-inline",
+      )
+      .forEach((el) => el.remove());
+    // Editing-state decorations must not ship: find highlights are wrapper
+    // spans (unwrap them), selection marks are classes.
+    clone.querySelectorAll("span.vellumi-match").forEach((span) => span.replaceWith(...span.childNodes));
+    clone.querySelectorAll(".vellumi-block-selected, .ProseMirror-selectednode").forEach((el) => {
+      el.classList.remove("vellumi-block-selected", "ProseMirror-selectednode");
+    });
+    clone.normalize();
+    // ---- Code blocks -------------------------------------------------------
+    // Crepe renders code through a CodeMirror nodeView: the container is a Vue
+    // app (`div.milkdown-code-block[data-v-app]`) with NO <pre> inside, so the
+    // scaffolding sweep at the end used to delete every code block that had
+    // been rendered. Rebuild each one as <pre><code>.
+    // The text comes from the ProseMirror document, not the DOM: CodeMirror
+    // virtualizes its lines, so a long block only has DOM for the lines that
+    // scrolled through the viewport.
+    const codeBlocks = [];
+    crepe.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      view.state.doc.descendants((node) => {
+        if (node.type.name === "code_block" || node.type.spec.code) {
+          codeBlocks.push({ language: node.attrs?.language ?? "", text: node.textContent });
+          return false;
+        }
+        return true;
+      });
+    });
+    Array.from(clone.querySelectorAll(".milkdown-code-block")).forEach((block, index) => {
+      const source = codeBlocks[index];
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      const language = source?.language || block.getAttribute("data-language") || "";
+      if (language) code.className = `language-${language}`;
+      // Fall back to the rendered lines only if the document lookup missed.
+      code.textContent =
+        source?.text ??
+        Array.from(block.querySelectorAll(".cm-line")).map((line) => line.textContent).join("\n");
+      pre.appendChild(code);
+      block.replaceWith(pre);
+    });
+
+    // ---- Tables ------------------------------------------------------------
+    // The table block is a Vue app too; unwrap it to the bare <table> so the
+    // column handles and drag affordances don't ship with the export.
+    clone.querySelectorAll(".milkdown-table-block").forEach((block) => {
+      // The block holds TWO <table> elements: an empty one inside
+      // `.drag-preview` (the drag ghost, first in document order) and the real
+      // one inside `.table-wrapper`. A bare querySelector("table") grabs the
+      // decoy and throws the content away.
+      // Discriminate on CONTENT, not position: `.drag-preview` sits inside
+      // `.table-wrapper` and comes first in document order, so both a bare
+      // querySelector("table") and a `.table-wrapper table` selector return
+      // the empty ghost and discard every row.
+      const table =
+        Array.from(block.querySelectorAll("table")).find(
+          (candidate) => candidate.querySelector("tr") && !candidate.closest(".drag-preview")
+        ) ?? block.querySelector("table");
+      if (table) block.replaceWith(table);
+    });
+
+    // ---- Lists -------------------------------------------------------------
+    // Crepe wraps every list item in Vue scaffolding (icon svg, label wrapper,
+    // children containers) that chokes downstream consumers — the card
+    // paginator dies on it and exported HTML drags editor chrome along.
+    // Restore standard <li> structure.
+    // Deepest-first (reverse document order): replacing an outer <li> before
+    // its nested items would freeze the scaffolding into the copied innerHTML.
+    Array.from(clone.querySelectorAll("li.list-item")).reverse().forEach((item) => {
+      const content = item.querySelector(".children .content-dom, .content-dom");
+      const plain = document.createElement("li");
+      if (content) {
+        // A single wrapping <p> is markdown-normal inside <li>.
+        plain.innerHTML = content.innerHTML;
+      } else {
+        plain.textContent = item.textContent; // never parse text as markup
+      }
+      // GFM task items: Crepe draws the checkbox as an inline SVG inside
+      // `.label-wrapper .label`, carrying the state in a `checked`/`unchecked`
+      // class — there is no <input> to find, which is why the state used to be
+      // dropped entirely (and the wrapper deleted by the sweep below).
+      const label = item.querySelector(".label-wrapper .label");
+      if (label?.classList.contains("checked") || label?.classList.contains("unchecked")) {
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.disabled = true;
+        if (label.classList.contains("checked")) box.setAttribute("checked", "");
+        plain.insertBefore(box, plain.firstChild);
+      }
+      const wrapper = item.closest("div.milkdown-list-item-block") ?? item;
+      wrapper.replaceWith(plain);
+    });
+
+    // ---- Images ------------------------------------------------------------
+    // Image blocks are Vue components too — collapse each to a plain <img>
+    // BEFORE the scaffolding sweep below would drop them. Containers that own
+    // richer structure are skipped: an unqualified querySelector("img") used
+    // to reach into a table cell and replace the ENTIRE table with that image.
+    clone.querySelectorAll("[data-v-app]").forEach((component) => {
+      if (component.querySelector("table, li, pre, .cm-editor")) return;
+      const img = component.querySelector("img");
+      if (img) {
+        const plain = document.createElement("img");
+        plain.setAttribute("src", img.getAttribute("src") ?? "");
+        const alt = img.getAttribute("alt");
+        if (alt) plain.setAttribute("alt", alt);
+        component.replaceWith(plain);
+      }
+    });
+    // Any remaining editor-only iconography/scaffolding without real content.
+    clone.querySelectorAll(".label-wrapper, .milkdown-icon, [data-v-app]").forEach((el) => {
+      if (el.querySelector("li, img, table, pre, blockquote")) return;
+      el.remove();
+    });
+    clone.querySelectorAll("br.ProseMirror-trailingBreak").forEach((el) => el.remove());
+    clone.querySelectorAll("img").forEach((img) => {
+      const src = img.getAttribute("src") ?? "";
+      if (!src.startsWith(ASSET_BASE)) return;
+      const raw = src.slice(ASSET_BASE.length);
+      img.setAttribute("src", decodeURI(raw));
+    });
+    return clone.innerHTML;
+  },
+  // Replaces the current match and moves to the next; returns {total, current}.
+  replaceCurrent(replacement) {
+    return withView((view) => searchCommands.replaceCurrent(view, replacement)) ?? { total: 0, current: 0 };
+  },
+  // Replaces every match in one undoable transaction; returns the count.
+  replaceAll(replacement) {
+    return withView((view) => searchCommands.replaceAll(view, replacement)) ?? 0;
+  },
+  // Swift answers an image-save request; null/undefined path = failure.
+  resolveImageSave(id, path) {
+    const pending = pendingImageSaves.get(id);
+    if (!pending) return;
+    pendingImageSaves.delete(id);
+    if (typeof path === "string" && path) {
+      pending.resolve(path);
+    } else {
+      pending.reject(new Error("image save failed"));
+    }
+  },
+  // Typography: preferences-driven CSS variable overrides. `scheme` picks a
+  // font stack ("default" keeps the theme's own), the numeric knobs feed CSS
+  // variables consumed in index.html. 0/null = theme default for each.
+  setTypography(config) {
+    const root2 = document.documentElement;
+    const scheme = config?.scheme;
+    if (scheme === "serif" || scheme === "sans") {
+      root2.setAttribute("data-vellumi-font", scheme);
+    } else {
+      root2.removeAttribute("data-vellumi-font");
+    }
+    const setVar = (name, value, unit) => {
+      if (typeof value === "number" && value > 0) {
+        root2.style.setProperty(name, `${value}${unit}`);
+      } else {
+        root2.style.removeProperty(name);
+      }
+    };
+    setVar("--vellumi-line-height", config?.lineHeight, "");
+    setVar("--vellumi-paragraph-spacing", config?.paragraphSpacing, "em");
+    setVar("--vellumi-max-width", config?.maxWidth, "px");
+  },
+  // Curly quotes / … / — while typing. Rebuilds the editor (rules are baked
+  // in at construction); content survives via the normal serialize path.
+  setSmartPunctuation(on) {
+    const next = Boolean(on);
+    if (next === smartPunctuationEnabled) return;
+    // Flush first: the rebuild below resets lastSentMarkdown to the current
+    // content, so anything still sitting in the debounce window would never
+    // be reported to the shell.
+    if (changeTimer) flushChange();
+    smartPunctuationEnabled = next;
+    if (crepe) {
+      const markdown = currentMarkdown();
+      lastSentMarkdown = markdown;
+      window.moltenAPI.setMarkdown(markdown);
+    }
+  },
+  // Scroll position exchange for source-mode round trips.
+  getScrollFraction() {
+    const max = document.documentElement.scrollHeight - window.innerHeight;
+    return max > 1 ? window.scrollY / max : 0;
+  },
+  setScrollFraction(fraction) {
+    if (typeof fraction !== "number") return;
+    pendingScrollFraction = Math.max(0, Math.min(1, fraction));
+    applyPendingScroll();
+  },
+  // View-mode toggles driven by the native View menu / Preferences.
+  setTypewriter(on) {
+    typewriterEnabled = Boolean(on);
+    if (typewriterEnabled) updateViewModes();
+  },
+  setFocusMode(on) {
+    focusModeEnabled = Boolean(on);
+    document.body.classList.toggle("vellumi-focus-mode", focusModeEnabled);
+    if (focusModeEnabled) {
+      updateViewModes();
+    } else {
+      focusedBlock?.classList.remove("vellumi-focus-active");
+      focusedBlock = null;
+    }
+  },
+  setSpellcheck(on) {
+    spellcheckEnabled = Boolean(on);
+    applySpellcheck();
+  },
+  // Exposed for tests: the display-time rewrite of document-relative srcs.
+  rewriteAssetURL,
+  // Exposed for the self-test: the exact path paste/drop uses.
+  uploadImageForTest: uploadImage,
+};
+
+// Boot failures must be loud: reach Swift over the bridge AND stay readable
+// for tests/debugging via window.__moltenBootError.
+window.addEventListener("error", (event) => {
+  window.__moltenBootError ??= String(event.error?.stack ?? event.message);
+});
+
+post({ type: "ready" });

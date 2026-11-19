@@ -1,0 +1,43 @@
+[package]
+name = "vellumi-desktop"
+description = "Vellumi desktop shell (Tauri 2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vellumi_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = { version = "2", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64 = "0.22"
+sys-locale = "0.3"
+notify = "8"
+regex = "1"
+vellumi-core.workspace = true
+vellumi-fs.workspace = true
+vellumi-index.workspace = true
+vellumi-legacy.workspace = true
+
+[features]
+# Auto-update via tauri-plugin-updater; needs the signing public key in
+# tauri.updater.conf.json (scripts/release.sh turns this on).
+updater = ["dep:tauri-plugin-updater"]
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSString", "NSURL", "NSArray", "NSDictionary"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKPDFConfiguration", "block2", "objc2-app-kit"] }
+block2 = "0.6"

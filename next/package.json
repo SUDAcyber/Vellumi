@@ -1,0 +1,16 @@
+{
+  "name": "vellumi-next",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/desktop"
+  ],
+  "scripts": {
+    "build:ui": "npm run build -w apps/desktop",
+    "test:js": "node --test packages/editor/test/*.test.mjs",
+    "app": "npm run build:ui && npm run tauri -w apps/desktop -- build --debug --bundles app",
+    "fidelity": "scripts/fidelity.sh",
+    "selftest": "scripts/selftest.sh",
+    "install:editor": "npm ci --prefix packages/editor"
+  }
+}

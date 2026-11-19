@@ -1,0 +1,12 @@
+[package]
+name = "vellumi-fs"
+description = "File IO for Vellumi: size-limited reads, atomic writes, fingerprints."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vellumi-core.workspace = true
+
+[lints]
+workspace = true

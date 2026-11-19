@@ -1,0 +1,6 @@
+target/
+node_modules/
+dist/
+apps/desktop/dist/
+apps/desktop/ui/public/themes/
+apps/desktop/src-tauri/gen/

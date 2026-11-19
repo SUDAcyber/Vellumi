@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vellumi-core",
+    "crates/vellumi-fs",
+    "crates/vellumi-index",
+    "crates/vellumi-legacy",
+    "apps/desktop/src-tauri",
+    
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vellumi-core = { path = "crates/vellumi-core" }
+vellumi-fs = { path = "crates/vellumi-fs" }
+vellumi-index = { path = "crates/vellumi-index" }
+vellumi-legacy = { path = "crates/vellumi-legacy" }
+
+# User data never goes through unwrap/expect/panic. Crates that touch user data
+# opt in with `[lints] workspace = true`; tests are exempt via cfg_attr.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

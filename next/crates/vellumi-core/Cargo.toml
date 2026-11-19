@@ -1,0 +1,17 @@
+[package]
+name = "vellumi-core"
+description = "Platform-agnostic document model for Vellumi: no Tauri, no objc, no async runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+regex = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

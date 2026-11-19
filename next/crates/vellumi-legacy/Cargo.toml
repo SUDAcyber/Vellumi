@@ -1,0 +1,14 @@
+[package]
+name = "vellumi-legacy"
+description = "Reads the Swift-era (0.5.x) UserDefaults and maps them onto the new settings. Read-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+plist = "1"
+thiserror.workspace = true
+vellumi-core.workspace = true
+
+[lints]
+workspace = true
