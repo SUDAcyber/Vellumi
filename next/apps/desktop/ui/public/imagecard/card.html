@@ -576,7 +576,10 @@
     const exportStage = document.getElementById("exportStage");
     const CONTINUATION_ATTR = "data-md2card-continuation";
     const LINE_START_FORBIDDEN_CHARS = new Set(Array.from("，。！？；：、,.!?;:)]}）】》〉」』”’％%…"));
-    const PAGINATION_YIELD_INTERVAL = 6;
+    // Pagination yields to the browser only after this much continuous work.
+    // (0.5.x yielded every 6 blocks and each yield waited a whole frame, so a
+    // long document spent most of its layout time idle.)
+    const PAGINATION_SLICE_MS = 40;
     const JPEG_EXPORT_QUALITY = 0.96;
 
     const state = {
@@ -590,7 +593,9 @@
         format: "png",
         paragraphIndent: "2em"
       },
-      renderGeneration: 0
+      renderGeneration: 0,
+      contentVersion: 0,
+      layoutKey: ""
     };
 
     // Vellumi (Tauri): the renderer runs in an iframe of the Cards window;
@@ -1239,11 +1244,24 @@
       return block?.tagName === "P" || block?.tagName === "BLOCKQUOTE";
     }
 
-    async function yieldToBrowser() {
-      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    // Lets the window paint and handle input during a long layout. Returns
+    // true when a newer render was requested meanwhile, so this pass stops.
+    let sliceStart = 0;
+    async function yieldIfStale(generation) {
+      if (performance.now() - sliceStart >= PAGINATION_SLICE_MS) {
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        sliceStart = performance.now();
+      }
+      return generation !== state.renderGeneration;
     }
 
-    async function paginateRenderedHtml(renderedHtml) {
+    // Only these change where pages break; watermark and format do not.
+    function currentLayoutKey() {
+      const { theme, size, paragraphIndent } = state.options;
+      return JSON.stringify([state.contentVersion, theme, size.width, size.height, paragraphIndent]);
+    }
+
+    async function paginateRenderedHtml(renderedHtml, generation) {
       const measure = createCardShell({ pageIndex: 0, pageCount: 1, includeWatermark: false });
       measureStage.replaceChildren(measure.wrapper);
 
@@ -1256,7 +1274,7 @@
         const pages = [];
         let currentNodes = [];
         let previousBlock = null;
-        let workCount = 0;
+        sliceStart = performance.now();
         const pushCurrentPage = () => {
           if (!currentNodes.length) {
             return;
@@ -1266,10 +1284,9 @@
         };
 
         for (const block of blocks) {
-          if (workCount && workCount % PAGINATION_YIELD_INTERVAL === 0) {
-            await yieldToBrowser();
+          if (await yieldIfStale(generation)) {
+            return null;
           }
-          workCount += 1;
 
           if (shouldForceHeadingPageBreak(block, previousBlock, currentNodes.length > 0)) {
             pushCurrentPage();
@@ -1277,10 +1294,9 @@
 
           const fragmentsQueue = [block.cloneNode(true)];
           while (fragmentsQueue.length) {
-            if (workCount && workCount % PAGINATION_YIELD_INTERVAL === 0) {
-              await yieldToBrowser();
+            if (await yieldIfStale(generation)) {
+              return null;
             }
-            workCount += 1;
 
             const fragment = fragmentsQueue.shift();
             if (!fragment) {
@@ -1357,18 +1373,24 @@
       });
     }
 
-    async function render({ preservePage = true } = {}) {
-      const generation = ++state.renderGeneration;
+    async function render({ preservePage = true } = {}, generation) {
+      if (generation !== state.renderGeneration) {
+        return;
+      }
       const previousPage = state.currentPage;
       applyDimensions();
       cardWrapper.className = `card-wrapper theme-${state.options.theme}`;
 
-      const pages = await paginateRenderedHtml(state.bodyHTML);
-      if (generation !== state.renderGeneration) {
-        return;
+      const layoutKey = currentLayoutKey();
+      if (layoutKey !== state.layoutKey) {
+        const pages = await paginateRenderedHtml(state.bodyHTML, generation);
+        if (!pages || generation !== state.renderGeneration) {
+          return;
+        }
+        state.pages = pages;
+        state.layoutKey = layoutKey;
       }
 
-      state.pages = pages;
       state.currentPage = preservePage ? clamp(previousPage, 0, state.pages.length - 1) : 0;
       renderCurrentPage();
       post({
@@ -1421,9 +1443,80 @@
       }
     }
 
+    // Export: html2canvas clones the whole document on every call, which cost
+    // more than drawing a card. Cards are stacked and captured in batches, then
+    // cut apart. A batch stays well under WebKit's canvas area limit.
+    const CAPTURE_BATCH_PIXELS = 12_000_000;
+
+    function captureFormat() {
+      return state.options.format === "jpeg"
+        ? { mimeType: "image/jpeg", quality: JPEG_EXPORT_QUALITY, backgroundColor: "#000000" }
+        : { mimeType: "image/png", quality: undefined, backgroundColor: null };
+    }
+
+    async function captureBatch(indexes) {
+      const { width, height } = state.options.size;
+      const totalPages = Math.max(state.pages.length, 1);
+      const formatConfig = captureFormat();
+      const stack = document.createElement("div");
+      stack.style.width = `${width}px`;
+      for (const index of indexes) {
+        const card = createCardShell({ pageIndex: index, pageCount: totalPages, includeWatermark: true });
+        card.content.innerHTML = state.pages[index] || "";
+        applyRuntimeRendering(card.content);
+        stack.appendChild(card.wrapper);
+      }
+      exportStage.replaceChildren(stack);
+      try {
+        if (document.fonts?.ready) {
+          try {
+            await document.fonts.ready;
+          } catch (error) {
+            // Font readiness is a quality hint; capture should still proceed.
+          }
+        }
+        const canvas = await html2canvas(stack, {
+          backgroundColor: formatConfig.backgroundColor,
+          width,
+          height: height * indexes.length,
+          scale: 1,
+          useCORS: true,
+          allowTaint: false,
+          logging: false
+        });
+        return indexes.map((_, offset) => {
+          const page = document.createElement("canvas");
+          page.width = width;
+          page.height = height;
+          page.getContext("2d").drawImage(canvas, 0, offset * height, width, height, 0, 0, width, height);
+          return page.toDataURL(formatConfig.mimeType, formatConfig.quality);
+        });
+      } finally {
+        exportStage.replaceChildren();
+      }
+    }
+
+    async function captureAllPages() {
+      const { width, height } = state.options.size;
+      const total = Math.max(state.pages.length, 1);
+      const perBatch = Math.max(1, Math.floor(CAPTURE_BATCH_PIXELS / Math.max(width * height, 1)));
+      const pages = [];
+      for (let start = 0; start < total; start += perBatch) {
+        const indexes = [];
+        for (let index = start; index < Math.min(total, start + perBatch); index += 1) indexes.push(index);
+        const urls = await captureBatch(indexes);
+        indexes.forEach((index, offset) => pages.push({ index, dataURL: urls[offset] }));
+      }
+      return pages;
+    }
+
     let renderQueue = Promise.resolve();
+    // A request supersedes every one before it: a queued pass that is already
+    // stale never starts, and a running one stops at its next yield. Opening
+    // the window sends content and options back to back — one layout, not two.
     function queueRender(options) {
-      const next = renderQueue.then(() => render(options));
+      const generation = ++state.renderGeneration;
+      const next = renderQueue.then(() => render(options, generation));
       renderQueue = next.catch(() => {});
       return next;
     }
@@ -1431,6 +1524,7 @@
     window.markmacCard = {
       setContent(bodyHTML) {
         state.bodyHTML = typeof bodyHTML === "string" ? bodyHTML : "";
+        state.contentVersion += 1;
         void queueRender({ preservePage: false }).catch((error) => postError(null, error));
       },
 
@@ -1471,13 +1565,7 @@
         void (async () => {
           // Capture the finished layout, never a pass still in flight.
           await renderQueue;
-          const pages = [];
-          for (let index = 0; index < Math.max(state.pages.length, 1); index += 1) {
-            pages.push({
-              index,
-              dataURL: await capturePageDataURL(index)
-            });
-          }
+          const pages = await captureAllPages();
           post({
             type: "captureAll",
             requestID: requestID || null,
