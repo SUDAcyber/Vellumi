@@ -73,3 +73,25 @@ export function detectListMarkers(markdown) {
   }
   return markers;
 }
+
+/** mdast: list items holding only the editor's empty-line `<br />`. */
+export function dropEmptyItemBreaks(tree) {
+  const walk = (node) => {
+    if (!Array.isArray(node?.children)) return;
+    if (node.type === "listItem" && node.children.length === 1) {
+      const [only] = node.children;
+      if (
+        only.type === "paragraph" &&
+        only.children?.length === 1 &&
+        only.children[0].type === "html" &&
+        /^<br\s*\/?>$/.test(String(only.children[0].value).trim())
+      ) {
+        node.children = [];
+        return;
+      }
+    }
+    node.children.forEach(walk);
+  };
+  walk(tree);
+  return tree;
+}

@@ -10,6 +10,7 @@
 // 3. Tight lists: list `spread` is parsed into the STRING "false", which the
 //    serializer's join rule ignores, so every tight list was saved loose.
 // 4. List markers: always `*` and `.`; the document's own markers are kept.
+// 5. An empty list item came back as `- <br />`.
 //
 // Edge newlines (blank line after front matter, final newline) and CRLF are
 // restored on the Rust side (vellumi-core DocumentSession).
@@ -23,6 +24,7 @@ import katex from "katex";
 
 import {
   detectListMarkers,
+  dropEmptyItemBreaks,
   imageAltForMarkdown,
   mathFenceAt,
   ratioFromAlt,
@@ -158,6 +160,12 @@ function serializerExtension(markdown) {
   return $remark("vellumiSerializer", () => function vellumiSerializer() {
     const data = this.data();
     (data.toMarkdownExtensions ??= []).push(extension);
+    // 5. An empty list item is written as `-`, not `- <br />` (the editor's
+    //    empty-paragraph marker, which loading strips again).
+    const compile = this.compiler;
+    if (typeof compile === "function") {
+      this.compiler = (tree, file) => compile(dropEmptyItemBreaks(tree), file);
+    }
   });
 }
 

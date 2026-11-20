@@ -48,3 +48,13 @@ test("list markers are detected outside code and thematic breaks", () => {
   assert.deepEqual(detectListMarkers("```\n- in code\n```\n* real\n"), { bullet: "*" });
   assert.deepEqual(detectListMarkers("plain text"), {});
 });
+
+test("an empty list item drops the editor's empty-line marker", async () => {
+  const { dropEmptyItemBreaks } = await import("../src/fidelity-rules.js");
+  const item = (children) => ({ type: "listItem", children });
+  const br = { type: "paragraph", children: [{ type: "html", value: "<br />" }] };
+  const tree = { type: "root", children: [{ type: "list", children: [item([br]), item([{ type: "paragraph", children: [{ type: "text", value: "a" }] }])] }] };
+  dropEmptyItemBreaks(tree);
+  assert.deepEqual(tree.children[0].children[0].children, []);
+  assert.equal(tree.children[0].children[1].children.length, 1);
+});

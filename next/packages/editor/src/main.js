@@ -30,7 +30,7 @@
 // throwaway empty editor at boot would double every document-open.
 
 import { Crepe } from "@milkdown/crepe";
-import { editorViewCtx } from "@milkdown/core";
+import { editorViewCtx, remarkCtx, serializerCtx } from "@milkdown/core";
 import mermaid from "mermaid";
 import { undoCommand, redoCommand } from "@milkdown/plugin-history";
 import {
@@ -53,6 +53,8 @@ import { callCommand, $prose, $view } from "@milkdown/utils";
 import { languages as codeLanguages } from "@codemirror/language-data";
 import { gemoji } from "gemoji";
 import { installFidelity } from "./fidelity.js";
+import { createSourcePreserver } from "./source-preserve.js";
+import { serializeKeepingRuns } from "./mark-runs.js";
 import { searchCommands, searchPlugin } from "./search.js";
 import { blockSelectionPlugin } from "./selection.js";
 import { buildToolbar, labelToolbar, toolbarIcons } from "./toolbar.js";
@@ -475,6 +477,8 @@ function rewriteAssetURL(url) {
 // ---------------------------------------------------------------------------
 
 async function createEditor(markdown) {
+  // Untouched blocks are saved as this text, byte for byte (source-preserve.js).
+  sourceMarkdown = markdown;
   const generation = ++loadGeneration;
   serializedDoc = null;
   serializedMarkdown = null;
@@ -586,6 +590,19 @@ function focusEditor() {
   crepe?.editor.action((ctx) => ctx.get(editorViewCtx).focus());
 }
 
+let sourceMarkdown = "";
+// Parses with the editor's own remark processor (same plugins as loading).
+const preserveSource = createSourcePreserver((text) =>
+  crepe.editor.action((ctx) => {
+    const processor = ctx.get(remarkCtx);
+    const raw = processor.parse(text);
+    // Top-level positions before transforms replace some nodes (diagrams).
+    const positions = raw.children.map((node) => node.position);
+    return { positions, tree: processor.runSync(raw, text) };
+  }),
+  (reason) => window.__vellumiLog?.("warn", `source-preserve fell back: ${reason}`)
+);
+
 let serializedDoc = null;
 let serializedMarkdown = null;
 let serializationCostMS = 0;
@@ -595,7 +612,8 @@ function currentMarkdown() {
     const doc = ctx.get(editorViewCtx).state.doc;
     if (doc !== serializedDoc) {
       const started = performance.now();
-      serializedMarkdown = crepe.getMarkdown();
+      const serialize = ctx.get(serializerCtx);
+      serializedMarkdown = preserveSource(sourceMarkdown, serializeKeepingRuns(doc, serialize));
       serializationCostMS = performance.now() - started;
       serializedDoc = doc;
     }
