@@ -13,11 +13,11 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Builds with the Command Line Tools when the Xcode license is not accepted.
-if ! xcodebuild -license check >/dev/null 2>&1; then
+if [[ "$(uname)" == "Darwin" ]] && ! xcodebuild -license check >/dev/null 2>&1; then
   export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 fi
 # shellcheck disable=SC1091
-source "$HOME/.cargo/env"
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 
 node --test "$ROOT"/packages/editor/test/*.test.mjs >/dev/null
 npm run build -w apps/desktop --prefix "$ROOT" >"$WORK/build.log" 2>&1 || { cat "$WORK/build.log"; exit 1; }

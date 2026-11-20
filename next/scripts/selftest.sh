@@ -8,11 +8,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-if ! xcodebuild -license check >/dev/null 2>&1; then
+if [[ "$(uname)" == "Darwin" ]] && ! xcodebuild -license check >/dev/null 2>&1; then
   export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 fi
 # shellcheck disable=SC1091
-source "$HOME/.cargo/env"
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 
 if [[ "${1:-}" != "--no-build" ]]; then
   npm run build -w apps/desktop --prefix "$ROOT" >"$WORK/build.log" 2>&1 || { cat "$WORK/build.log"; exit 1; }
