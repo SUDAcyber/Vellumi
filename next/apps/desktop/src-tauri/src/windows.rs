@@ -146,6 +146,85 @@ fn set_document_edited(window: &WebviewWindow, dirty: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_document_edited(_window: &WebviewWindow, _dirty: bool) {}
 
+/// The visible document window a new document joins as a tab: the focused
+/// one, else any visible one.
+#[cfg(target_os = "macos")]
+fn tab_host(app: &AppHandle, new_label: &str) -> Option<WebviewWindow<Wry>> {
+    let candidates: Vec<_> = doc_windows(app)
+        .into_iter()
+        .filter(|window| window.label() != new_label && window.is_visible().unwrap_or(false))
+        .collect();
+    let focused = candidates.iter().position(|window| window.is_focused().unwrap_or(false));
+    match focused {
+        Some(index) => candidates.into_iter().nth(index),
+        None => candidates.into_iter().next(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tab_host(_app: &AppHandle, _new_label: &str) -> Option<WebviewWindow<Wry>> {
+    None
+}
+
+/// NSWindowTabbingModePreferred: macOS keeps this window's documents in tabs
+/// even when the system setting says "only in full screen".
+#[cfg(target_os = "macos")]
+fn prefer_tabs(window: &WebviewWindow) {
+    let Ok(pointer) = window.ns_window() else { return };
+    let address = pointer as usize;
+    let result = window.run_on_main_thread(move || {
+        let object = address as *mut objc2::runtime::AnyObject;
+        // SAFETY: the NSWindow is alive (owned by the webview window that
+        // scheduled this) and setTabbingMode: takes an NSInteger.
+        unsafe {
+            if let Some(window) = object.as_ref() {
+                let _: () = objc2::msg_send![window, setTabbingMode: 1_isize];
+            }
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[vellumi] setTabbingMode failed: {error}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_tabs(_window: &WebviewWindow) {}
+
+/// Adds the (hidden) `window` as a tab of `host` and brings it forward.
+/// Right-clicking a tab offers macOS's own "Move Tab to New Window".
+#[cfg(target_os = "macos")]
+fn join_tab_group(host: &WebviewWindow, window: &WebviewWindow) {
+    let (Ok(host_pointer), Ok(pointer)) = (host.ns_window(), window.ns_window()) else {
+        let _ = window.show();
+        return;
+    };
+    let host_address = host_pointer as usize;
+    let address = pointer as usize;
+    let result = window.run_on_main_thread(move || {
+        let host = host_address as *mut objc2::runtime::AnyObject;
+        let object = address as *mut objc2::runtime::AnyObject;
+        // SAFETY: both NSWindows are alive (owned by their webview windows);
+        // addTabbedWindow:ordered: takes an NSWindow and NSWindowOrderingMode
+        // (NSWindowAbove = 1); makeKeyAndOrderFront: takes an id.
+        unsafe {
+            if let (Some(host), Some(window)) = (host.as_ref(), object.as_ref()) {
+                let _: () = objc2::msg_send![host, addTabbedWindow: window, ordered: 1_isize];
+                let nil: *const objc2::runtime::AnyObject = std::ptr::null();
+                let _: () = objc2::msg_send![window, makeKeyAndOrderFront: nil];
+            }
+        }
+    });
+    if let Err(error) = result {
+        eprintln!("[vellumi] addTabbedWindow failed: {error}");
+        let _ = window.show();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn join_tab_group(_host: &WebviewWindow, window: &WebviewWindow) {
+    let _ = window.show();
+}
+
 /// Opens `session` in a new window (or focuses the window already showing
 /// that file). Returns the window label.
 pub fn open_document(app: &AppHandle, session: DocumentSession, recovery_id: Option<String>) -> AppResult<String> {
@@ -167,12 +246,15 @@ pub fn open_document(app: &AppHandle, session: DocumentSession, recovery_id: Opt
     entry.recovery_id = recovery_id;
     state.docs().insert(label.clone(), entry);
 
+    // Documents open as tabs of the current document window. The new window
+    // starts hidden so it never flashes as a separate window first.
+    let host = if headless() { None } else { tab_host(app, &label) };
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .title(&title)
         .inner_size(1100.0, 760.0)
         .min_inner_size(560.0, 360.0)
         .initialization_script(init_script())
-        .visible(!headless());
+        .visible(!headless() && host.is_none());
     // Hidden harness windows: WebKit would otherwise throttle (then suspend)
     // their timers, stalling the self-test.
     let builder = if headless() {
@@ -187,6 +269,10 @@ pub fn open_document(app: &AppHandle, session: DocumentSession, recovery_id: Opt
         Ok(window) => {
             let settings = state.settings().clone();
             apply_window_settings(&window, &settings);
+            prefer_tabs(&window);
+            if let Some(host) = host {
+                join_tab_group(&host, &window);
+            }
         }
         Err(error) => {
             state.docs().remove(&label);
